@@ -34,10 +34,12 @@ class Worker:
         logging.basicConfig()
         # XXX init sentry???
 
+        # environment variable automagically set in Dokku:
         self.url = os.environ.get('RABBITMQ_URL')
         self.main_loop()
 
     def main_loop(self):
+        # _COULD_ launch multiple threads?!
         parameters = pika.connection.URLParameters(self.url)
         with pika.BlockingConnection(parameters) as conn:
             chan = conn.channel()
@@ -73,7 +75,7 @@ class Worker:
             pika.BasicProperies(content_type=content_type))
 
     def process_message(self, chan, method, properties, decoded):
-        raise PipelineException("need to define process_message")
+        raise PipelineException("Worker.process_message not overridden")
 
 
 class ListWorker(Worker):
@@ -85,12 +87,13 @@ class ListWorker(Worker):
             # XXX return exchange name too???
             result = self.process_item(item)
             if result:
-                # XXX have a "put" worker function to do splitting?
+                # XXX have a "put" worker function to do splitting on demand?
+                # (use transactions to get all-or-nothing???)
                 results.append(result)
         self.send_results(chan, results)
 
     def process_item(self, item):
-        raise PipelineException("need to define process_item")
+        raise PipelineException("ListWorker.process_item not overridden")
 
     def send_results(self, chan, items):
         # XXX split up into multiple msgs as needed!
