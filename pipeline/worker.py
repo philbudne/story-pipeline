@@ -11,7 +11,7 @@ import pickle
 # PyPI
 import pika
 
-class PipelineException:
+class PipelineException(Exception):
     """base class for pipeline exceptions"""
 
 logger = logging.getLogger(__name__)
@@ -34,17 +34,45 @@ class Worker:
         logging.basicConfig()
         # XXX init sentry???
 
+
         # environment variable automagically set in Dokku:
         self.url = os.environ.get('RABBITMQ_URL')
-        self.main_loop()
-
-    def main_loop(self):
-        # _COULD_ launch multiple threads?!
+        if not self.url:
+            raise PipelineException('need RABBITMQ_URL')
         parameters = pika.connection.URLParameters(self.url)
         with pika.BlockingConnection(parameters) as conn:
-            chan = conn.channel()
-            chan.basic_consume(self.input_queue_name, self.on_message)
-            chan.start_consuming()
+            print("connected to rabbitmq: calling main_loop") # TEMP
+            self.main_loop(conn)
+
+    def main_loop(self, conn):
+        raise PipelineException('must override main_loop!')
+
+    def encode_message(self, data):
+        # XXX allow control over encoding?
+        # see ConsumerWorker decode_message!!!
+        encoded = pickle.dumps(data)
+        # return (content-type, content-encoding, body)
+        return (TYPE_PICKLE, 'none', encoded)
+
+    def send_message(self, chan, data, exchange=None, routing_key='default'):
+        # XXX wrap, and include message history?
+        content_type, content_encoding, encoded = self.encode_message(data)
+        chan.basic_publish(
+            exchange or self.output_exchange_name,
+            routing_key,
+            encoded,            # body
+            pika.BasicProperies(content_type=content_type))
+
+
+class ConsumerWorker:
+    def main_loop(self, conn):
+        """
+        basic main_loop for a consumer.
+        override for a producer!
+        """
+        chan = conn.channel()
+        chan.basic_consume(self.input_queue_name, self.on_message)
+        chan.start_consuming()
 
     def on_message(self, chan, method, properties, body):
         """basic_consume callback function"""
@@ -59,26 +87,11 @@ class Worker:
         # XXX send stats on delay since last hop???
         return decoded
 
-    def encode_message(self, data):
-        # XXX allow control over encoding?
-        encoded = pickle.dumps(data)
-        # return (content-type, content-encoding, body)
-        return (TYPE_PICKLE, 'none', encoded)
-
-    def send_message(self, chan, data, exchange=None, routing_key='default'):
-        # XXX wrap, and include message history?
-        content_type, content_encoding, encoded = self.encode_message(data)
-        chan.basic_publish(
-            exchange or self.output_exchange_name,
-            routing_key,
-            encoded,            # body
-            pika.BasicProperies(content_type=content_type))
-
     def process_message(self, chan, method, properties, decoded):
         raise PipelineException("Worker.process_message not overridden")
 
 
-class ListWorker(Worker):
+class ListConsumerWorker(Worker):
     """Pipeline worker that handles list of work items"""
 
     def process_message(self, chan, method, properties, decoded):
@@ -98,3 +111,11 @@ class ListWorker(Worker):
     def send_results(self, chan, items):
         # XXX split up into multiple msgs as needed!
         self.send_message(chan, items)
+
+def run(klass):
+    """
+    run worker process, takes Worker subclass
+    could, in theory create threads or asyncio tasks.
+    """
+    worker = klass()
+    worker.main()
