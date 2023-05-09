@@ -29,4 +29,4 @@ class Gen(Worker):
 
 
 if __name__ == '__main__':
-    run(Gen)
+    run(Gen, "simple-gen", "generator for simple pipeline")

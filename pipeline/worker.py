@@ -4,6 +4,7 @@ Pipeline Worker Definitions
 
 # possible to use tx_select to select transaction mode to get all/or nothing sends to multiple exchanges?
 
+import argparse
 import logging
 import os
 import pickle
@@ -11,40 +12,57 @@ import pickle
 # PyPI
 import pika
 
+
 class PipelineException(Exception):
     """base class for pipeline exceptions"""
 
 logger = logging.getLogger(__name__)
 
 # content types:
-TYPE_PICKLE = 'application/python-pickle'
+MIME_TYPE_PICKLE = 'application/python-pickle'
+
+DEFAULT_ROUTING_KEY = 'default'
 
 class Worker:
     """base class for AMQP/pika based pipeline worker"""
-    def __init__(self):
-        self.url = None                  # Optional[str]
-        self.input_queue_name = None     # Optional[str]
-        self.output_exchange_name = None # Optional[str]
+    def __init__(self, process_name: str, descr: str):
+        self.process_name = process_name
+        self.descr = descr
+        self.args = None        # set by main
+
+        # XXX maybe have command line options???
+        # script/configure.py creates queues/exchanges with process-{in,out}
+        # names based on pipeline.json file:
+        self.input_queue_name = f"{self.process_name}-in"
+        self.output_exchange_name = f"{self.process_name}-out"
+
+    def define_options(self, ap: argparse.ArgumentParser):
+        """
+        subclass if additional options/argument needed by process;
+        subclass methods _SHOULD_ call super() method!!
+        """
+        # environment variable automagically set in Dokku:
+        default_url = os.environ.get('RABBITMQ_URL')  # set by Dokku
+        ap.add_argument('--rabbitmq-url', '-U', dest='amqp_url',
+                        default=default_url,
+                        help="set RabbitMQ URL (default {default_url}")
 
     def main(self):
-        # default values:
-        # XXX call method to add command line parser options
+        # call before logargparser.my_parse_args:
+        ap = argparse.ArgumentParser(self.process_name, self.descr)
+        self.define_options(ap)
+        self.args = ap.parse_args()
 
-        # XXX process command line for logging/queue params, open log file??
-        logging.basicConfig()
-        # XXX init sentry???
+        print(dir(self.args))
+        if not self.args.amqp_url:
+            raise PipelineException('need RabbitMQ URL')
+        parameters = pika.connection.URLParameters(self.args.amqp_url)
 
-
-        # environment variable automagically set in Dokku:
-        self.url = os.environ.get('RABBITMQ_URL')
-        if not self.url:
-            raise PipelineException('need RABBITMQ_URL')
-        parameters = pika.connection.URLParameters(self.url)
         with pika.BlockingConnection(parameters) as conn:
-            print("connected to rabbitmq: calling main_loop") # TEMP
+            logger.info("connected to rabbitmq: calling main_loop")
             self.main_loop(conn)
 
-    def main_loop(self, conn):
+    def main_loop(self, conn: pika.BlockingConnection):
         raise PipelineException('must override main_loop!')
 
     def encode_message(self, data):
@@ -52,9 +70,10 @@ class Worker:
         # see ConsumerWorker decode_message!!!
         encoded = pickle.dumps(data)
         # return (content-type, content-encoding, body)
-        return (TYPE_PICKLE, 'none', encoded)
+        return (MIME_TYPE_PICKLE, 'none', encoded)
 
-    def send_message(self, chan, data, exchange=None, routing_key='default'):
+    def send_message(self, chan, data, exchange=None,
+                     routing_key : str = DEFAULT_ROUTING_KEY):
         # XXX wrap, and include message history?
         content_type, content_encoding, encoded = self.encode_message(data)
         chan.basic_publish(
@@ -64,8 +83,8 @@ class Worker:
             pika.BasicProperies(content_type=content_type))
 
 
-class ConsumerWorker:
-    def main_loop(self, conn):
+class ConsumerWorker(Worker):
+    def main_loop(self, conn: pika.BlockingConnection):
         """
         basic main_loop for a consumer.
         override for a producer!
@@ -91,7 +110,7 @@ class ConsumerWorker:
         raise PipelineException("Worker.process_message not overridden")
 
 
-class ListConsumerWorker(Worker):
+class ListConsumerWorker(ConsumerWorker):
     """Pipeline worker that handles list of work items"""
 
     def process_message(self, chan, method, properties, decoded):
@@ -110,12 +129,13 @@ class ListConsumerWorker(Worker):
 
     def send_results(self, chan, items):
         # XXX split up into multiple msgs as needed!
+        # XXX per-process default on items/msg?????
         self.send_message(chan, items)
 
-def run(klass):
+def run(klass, *args, **kw):
     """
     run worker process, takes Worker subclass
     could, in theory create threads or asyncio tasks.
     """
-    worker = klass()
+    worker = klass(*args, **kw)
     worker.main()
