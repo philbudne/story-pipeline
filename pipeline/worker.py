@@ -8,6 +8,7 @@ import argparse
 import logging
 import os
 import pickle
+import sys
 
 # PyPI
 import pika
@@ -60,9 +61,10 @@ class Worker:
 
         with pika.BlockingConnection(parameters) as conn:
             logger.info("connected to rabbitmq: calling main_loop")
-            self.main_loop(conn)
+            chan = conn.channel()
+            self.main_loop(conn, chan)
 
-    def main_loop(self, conn: pika.BlockingConnection):
+    def main_loop(self, conn: pika.BlockingConnection, chan):
         raise PipelineException('must override main_loop!')
 
     def encode_message(self, data):
@@ -80,16 +82,19 @@ class Worker:
             exchange or self.output_exchange_name,
             routing_key,
             encoded,            # body
-            pika.BasicProperies(content_type=content_type))
+            pika.BasicProperties(content_type=content_type))
 
+    def send_items(self, chan, items):
+        # XXX split up into multiple msgs as needed!
+        # XXX per-process default on items/msg?????
+        self.send_message(chan, items)
 
 class ConsumerWorker(Worker):
-    def main_loop(self, conn: pika.BlockingConnection):
+    def main_loop(self, conn: pika.BlockingConnection, chan):
         """
         basic main_loop for a consumer.
         override for a producer!
         """
-        chan = conn.channel()
         chan.basic_consume(self.input_queue_name, self.on_message)
         chan.start_consuming()
 
@@ -98,6 +103,7 @@ class ConsumerWorker(Worker):
 
         decoded = self.decode_message(properties, body)
         self.process_message(chan, method, properties, decoded)
+        sys.stdout.flush()      # running under supervisord
 
     def decode_message(self, properties, body):
         # XXX look at content-type to determine how to decode
@@ -122,15 +128,11 @@ class ListConsumerWorker(ConsumerWorker):
                 # XXX have a "put" worker function to do splitting on demand?
                 # (use transactions to get all-or-nothing???)
                 results.append(result)
-        self.send_results(chan, results)
+        if results:
+            self.send_items(chan, results)
 
     def process_item(self, item):
         raise PipelineException("ListWorker.process_item not overridden")
-
-    def send_results(self, chan, items):
-        # XXX split up into multiple msgs as needed!
-        # XXX per-process default on items/msg?????
-        self.send_message(chan, items)
 
 def run(klass, *args, **kw):
     """

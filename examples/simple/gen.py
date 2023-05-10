@@ -12,7 +12,7 @@ class Gen(Worker):
     example data source worker
     """
 
-    def main_loop(self, conn):
+    def main_loop(self, conn, chan):
         n = 0
 
         while True:
@@ -23,6 +23,9 @@ class Gen(Worker):
                 l.append(n)
                 n += 1
             print(l)
+
+            print("sending...")
+            self.send_items(chan, l)
 
             print("sleeping...")
             time.sleep(10)

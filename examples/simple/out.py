@@ -2,7 +2,7 @@
 data sink: outputs list items
 """
 
-from pipeline.worker import Worker, run
+from pipeline.worker import ListConsumerWorker, run
 
 class Out(ListConsumerWorker):
     """
@@ -10,7 +10,7 @@ class Out(ListConsumerWorker):
     """
 
     def process_item(self, item):
-        print(item)
+        print("out:", item)
         return None
 
 run(Out, "simple-out", "output worker for simple pipeline")

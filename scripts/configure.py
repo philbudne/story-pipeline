@@ -11,6 +11,7 @@ Fanout exchanges are represented by a list,
 And must only appear as the last element of a list.
 """
 
+import argparse
 from enum import Enum
 import json
 import logging
@@ -170,55 +171,104 @@ def get_definitions(par: pika.connection.URLParameters) -> Dict[str, Any]:
     api = AdminAPI(url=f'http://{par.host}:{port}', auth=(creds.username, creds.password))
     return api.get_definitions()
 
+def listify(l):
+    return ", ".join(l)
+
+COMMANDS = ['configure', 'delete', 'dump', 'show', 'trim']
 def main():
-    amqp_url = os.environ.get('RABBITMQ_URL') # XXX --amqp-url??
-    if len(sys.argv) > 1:
-        fname = sys.argv[1]     # XXX -- --plumbing-file??
+    # XXX use rss-fetcher logargparse???
+    ap = argparse.ArgumentParser("configure", "configure RabbitMQ queues")
+
+    amqp_url = os.environ.get('RABBITMQ_URL')
+    ap.add_argument('--rabbitmq-url', '-U', dest='amqp_url',
+                    default=amqp_url,
+                    help="set RabbitMQ URL (default {amqp_url}")
+
+    def_file = 'plumbing.json'
+    ap.add_argument('--plumbing-file', '-f', dest='plumbing_file',
+                    default=def_file,
+                    help="JSON plumbing file (default {def_file})")
+
+    ap.add_argument('command', nargs=1, type=str,
+                    choices=COMMANDS,
+                    help='Command, one of: {listify(COMMANDS).')
+
+    # parse command line:
+    args = ap.parse_args()
+
+    command = args.command[0]
+    if command != 'show':
+        p = Plumbing(args.plumbing_file)  # parse plumbing file
     else:
-        fname = 'plumbing.json'
+        p = None
 
-    p = Plumbing(fname)         # parse plumbing file
+    if command == 'dump':
+        print(f"{args.plumbing_file}:")
+        print("    processes", listify(p.processes))
+        print("    queues", listify(p.queues.keys()))
+        print("    exchanges", listify(p.exchanges.keys()))
+        print("    bindings", p.bindings)
+        sys.exit(0)
 
-    def listify(l):
-        return ", ".join(l)
-
-    # XXX "dump" subcommand?
-    print(f"{fname}:")
-    print("    processes", listify(p.processes))
-    print("    queues", listify(p.queues.keys()))
-    print("    exchanges", listify(p.exchanges.keys()))
-    print("    bindings", p.bindings)
-
-    par = pika.connection.URLParameters(amqp_url)
+    par = pika.connection.URLParameters(args.amqp_url)
 
     # use RabbitMQ admin API to get current config
     # (not available via AMQP):
-    defns = get_definitions(par)
-    print("RabbitMQ current:")
-    curr_queues = [q['name'] for q in defns['queues']]
-    curr_exchanges = [(e['name'], e['type']) for e in defns['exchanges']]
-    curr_bindings = []
-    print("    queues", curr_queues)
-    print("    exchanges", curr_exchanges)
-    print("    bindings", defns['bindings'])
+    if command != 'configure':
+        defns = get_definitions(par)
+    else:
+        defns = {}
 
-    # use AMQP to configure:
-    logging.getLogger("pika").setLevel(logging.WARNING) # reduce blather
+    if command == 'show':
+        curr_queues = [q['name'] for q in defns['queues']]
+        curr_exchanges = [(e['name'], e['type']) for e in defns['exchanges']]
+        curr_bindings = []      # XXX
+        print("RabbitMQ current:")
+        print("    queues", curr_queues)
+        print("    exchanges", curr_exchanges)
+        print("    bindings", defns['bindings'])
+        sys.exit(0)
 
     # blindly configure for now:
+    logging.getLogger("pika").setLevel(logging.WARNING) # reduce blather
+
+    # use AMQP to (de)configure: 
     with pika.BlockingConnection(par) as conn:
         chan = conn.channel()
-        for qname in p.queues.keys():
-            # durable == stored on disk
-            chan.queue_declare(qname, durable=True)
 
-        for exch in p.exchanges.values():
-            chan.exchange_declare(exch.name, exch.type)
+        if command == 'configure':
 
-        for b in p.bindings:
-            # XXX check b.dtype!!
-            chan.queue_bind(b.dest, b.source,
-                            routing_key=DEFAULT_ROUTING_KEY)
+            for qname in p.queues.keys():
+                # durable == messages stored on disk
+                chan.queue_declare(qname, durable=True)
+
+            for exch in p.exchanges.values():
+                chan.exchange_declare(exch.name, exch.type)
+
+            for b in p.bindings:
+                # XXX check b.dtype!!
+                chan.queue_bind(b.dest, b.source,
+                                routing_key=DEFAULT_ROUTING_KEY)
+
+        elif command == 'delete':
+            print("deleting...")
+
+            for qname in p.queues.keys():
+                chan.queue_delete(qname)
+
+            for exch in p.exchanges.values():
+                chan.exchange_delete(exch.name)
+
+            for b in p.bindings:
+                chan.queue_unbind(b.dest, exchange=b.source,
+                                  routing_key=DEFAULT_ROUTING_KEY)
+        elif command == 'trim':
+            print("trim not yet implemented")
+            # iterate over items in defns, and remove those not in config
+            sys.exit(1)
+        else:
+            print(f"unknown command {command}")
+            sys.exit(1)
 
 if __name__ == '__main__':
     main()
