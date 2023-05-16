@@ -25,7 +25,12 @@ MIME_TYPE_PICKLE = 'application/python-pickle'
 DEFAULT_ROUTING_KEY = 'default'
 
 class Worker:
-    """base class for AMQP/pika based pipeline worker"""
+    """
+    Base class for AMQP/pika based pipeline Worker.
+    Producers (processes that have no input queue)
+    should derive from this class
+    """
+
     def __init__(self, process_name: str, descr: str):
         self.process_name = process_name
         self.descr = descr
@@ -84,12 +89,10 @@ class Worker:
             encoded,            # body
             pika.BasicProperties(content_type=content_type))
 
-    def send_items(self, chan, items):
-        # XXX split up into multiple msgs as needed!
-        # XXX per-process default on items/msg?????
-        self.send_message(chan, items)
 
 class ConsumerWorker(Worker):
+    """Base class for Workers that consume messages"""
+
     def main_loop(self, conn: pika.BlockingConnection, chan):
         """
         basic main_loop for a consumer.
@@ -99,11 +102,17 @@ class ConsumerWorker(Worker):
         chan.start_consuming()
 
     def on_message(self, chan, method, properties, body):
-        """basic_consume callback function"""
+        """
+        basic_consume callback function
+        see also BatchInputMixin
+        """
 
         decoded = self.decode_message(properties, body)
         self.process_message(chan, method, properties, decoded)
-        sys.stdout.flush()      # running under supervisord
+
+        # XXX check processing status??
+        chan.basic_ack(delivery_tag=method.delivery_tag)
+        sys.stdout.flush()      # for redirection, supervisord
 
     def decode_message(self, properties, body):
         # XXX look at content-type to determine how to decode
@@ -131,8 +140,62 @@ class ListConsumerWorker(ConsumerWorker):
         if results:
             self.send_items(chan, results)
 
+    def send_items(self, chan, items):
+        # XXX split up into multiple msgs as needed!
+        # XXX per-process (OUTPUT_BATCH) for max items/msg?????
+        self.send_message(chan, items)
+
     def process_item(self, item):
         raise PipelineException("ListWorker.process_item not overridden")
+
+class BatchInputMixin:
+    """
+    Mixin for Consumers for batched input (ie; database writers)
+    Needs to appear BEFORE Consumer class in inheritance list!!!
+    XXX maybe bake into base class(es)????
+    """
+    # raise this to allow input batching
+    INPUT_BATCH = 1
+
+    def __init__(self, process_name: str, descr: str):
+        self.input_messages = []
+        self.output_items = []
+        super().__init__(process_name, descr)
+
+    def main_loop(self, conn: pika.BlockingConnection, chan):
+         # XXX allow environment/cmd-line override??
+        chan.basic_qos(self.INPUT_BATCH, global_qos=False)  # RabbitMQ extension
+        super().main_loop()
+
+    def on_message(self, chan, method, properties, body):
+        """
+        basic_consume callback function
+        see also BatchInputMixin
+        """
+
+        self.input_msgs.append( (method, properties, body) )
+        if len(self.input_msgs) < self.INPUT_BATCH:
+            return
+
+        # here with full batch: start processing
+        for m, p, b in self.input_msgs:
+            decoded = self.decode_message(p, b)
+            self.process_message(chan, m, p, decoded)
+            # XXX check processing status??
+        self.input_msgs = []
+
+        # send before ack:
+        if self.output_items:
+            super().send_items(chan, self.output_items)
+            self.output_items = []
+
+        # ack last message only:
+        chan.basic_ack(delivery_tag=method.delivery_tag)
+
+        sys.stdout.flush()      # for redirection, supervisord
+
+    def send_items(self, chan, items):
+        self.output_items.extend( items )
 
 def run(klass, *args, **kw):
     """
