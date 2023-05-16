@@ -49,6 +49,7 @@ class Worker:
         """
         # environment variable automagically set in Dokku:
         default_url = os.environ.get('RABBITMQ_URL')  # set by Dokku
+        # XXX give env var name instead of value?
         ap.add_argument('--rabbitmq-url', '-U', dest='amqp_url',
                         default=default_url,
                         help="set RabbitMQ URL (default {default_url}")
@@ -59,7 +60,6 @@ class Worker:
         self.define_options(ap)
         self.args = ap.parse_args()
 
-        print(dir(self.args))
         if not self.args.amqp_url:
             raise PipelineException('need RabbitMQ URL')
         parameters = pika.connection.URLParameters(self.args.amqp_url)
@@ -93,25 +93,47 @@ class Worker:
 class ConsumerWorker(Worker):
     """Base class for Workers that consume messages"""
 
+    # override this to allow enable input batching
+    INPUT_BATCH = 1
+
+    def __init__(self, process_name: str, descr: str):
+        super().__init__(process_name, descr)
+        self.input_msgs = []
+
     def main_loop(self, conn: pika.BlockingConnection, chan):
         """
         basic main_loop for a consumer.
         override for a producer!
         """
+        # XXX allow environment/cmd-line override??
+        if self.INPUT_BATCH > 1:
+            chan.basic_qos(self.INPUT_BATCH, global_qos=False)  # RabbitMQ ext.
+        chan.tx_select()        # enter transaction mode
         chan.basic_consume(self.input_queue_name, self.on_message)
         chan.start_consuming()
 
     def on_message(self, chan, method, properties, body):
         """
         basic_consume callback function
-        see also BatchInputMixin
         """
 
-        decoded = self.decode_message(properties, body)
-        self.process_message(chan, method, properties, decoded)
+        self.input_msgs.append( (method, properties, body) )
+        if len(self.input_msgs) < self.INPUT_BATCH:
+            return
 
-        # XXX check processing status??
+        # here with full batch: start processing
+        for m, p, b in self.input_msgs:
+            decoded = self.decode_message(p, b)
+            self.process_message(chan, m, p, decoded)
+            # XXX check processing status??
+
+        self.flush_output(self, chan)
+        chan.tx_commit()
+
+        # ack last message only:
         chan.basic_ack(delivery_tag=method.delivery_tag)
+        self.input_msgs = []
+
         sys.stdout.flush()      # for redirection, supervisord
 
     def decode_message(self, properties, body):
@@ -125,77 +147,35 @@ class ConsumerWorker(Worker):
         raise PipelineException("Worker.process_message not overridden")
 
 
+    def flush_output(self):
+        """hook for ListConsumer"""
+
 class ListConsumerWorker(ConsumerWorker):
     """Pipeline worker that handles list of work items"""
+
+    def __init__(self, process_name: str, descr: str):
+        super().__init__(process_name, descr)
+        self.output_items = []
 
     def process_message(self, chan, method, properties, decoded):
         results = []
         for item in decoded:
-            # XXX return exchange name too???
+            # XXX return exchange name too?
             result = self.process_item(item)
             if result:
-                # XXX have a "put" worker function to do splitting on demand?
-                # (use transactions to get all-or-nothing???)
-                results.append(result)
-        if results:
-            self.send_items(chan, results)
+                # XXX append to per-exchange list?
+                self.output_items(result)
 
-    def send_items(self, chan, items):
+    def flush_output(self, chan):
         # XXX split up into multiple msgs as needed!
         # XXX per-process (OUTPUT_BATCH) for max items/msg?????
-        self.send_message(chan, items)
+        # XXX iterate for dict of lists of items by dest exchange??
+        self.send_message(chan, self.output_items)
+        self.output_items = []
 
     def process_item(self, item):
-        raise PipelineException("ListWorker.process_item not overridden")
-
-class BatchInputMixin:
-    """
-    Mixin for Consumers for batched input (ie; database writers)
-    Needs to appear BEFORE Consumer class in inheritance list!!!
-    XXX maybe bake into base class(es)????
-    """
-    # raise this to allow input batching
-    INPUT_BATCH = 1
-
-    def __init__(self, process_name: str, descr: str):
-        self.input_messages = []
-        self.output_items = []
-        super().__init__(process_name, descr)
-
-    def main_loop(self, conn: pika.BlockingConnection, chan):
-         # XXX allow environment/cmd-line override??
-        chan.basic_qos(self.INPUT_BATCH, global_qos=False)  # RabbitMQ extension
-        super().main_loop()
-
-    def on_message(self, chan, method, properties, body):
-        """
-        basic_consume callback function
-        see also BatchInputMixin
-        """
-
-        self.input_msgs.append( (method, properties, body) )
-        if len(self.input_msgs) < self.INPUT_BATCH:
-            return
-
-        # here with full batch: start processing
-        for m, p, b in self.input_msgs:
-            decoded = self.decode_message(p, b)
-            self.process_message(chan, m, p, decoded)
-            # XXX check processing status??
-        self.input_msgs = []
-
-        # send before ack:
-        if self.output_items:
-            super().send_items(chan, self.output_items)
-            self.output_items = []
-
-        # ack last message only:
-        chan.basic_ack(delivery_tag=method.delivery_tag)
-
-        sys.stdout.flush()      # for redirection, supervisord
-
-    def send_items(self, chan, items):
-        self.output_items.extend( items )
+        raise PipelineException(
+            "ListConsumerWorker.process_item not overridden")
 
 def run(klass, *args, **kw):
     """
