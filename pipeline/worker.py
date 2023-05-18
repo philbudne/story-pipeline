@@ -36,6 +36,9 @@ class Worker:
         self.descr = descr
         self.args = None        # set by main
 
+        # ~sigh~ wanted to avoid this, but "call_later" requires it
+        self.connection = None
+
         # XXX maybe have command line options???
         # script/configure.py creates queues/exchanges with process-{in,out}
         # names based on pipeline.json file:
@@ -64,10 +67,11 @@ class Worker:
             raise PipelineException('need RabbitMQ URL')
         parameters = pika.connection.URLParameters(self.args.amqp_url)
 
-        with pika.BlockingConnection(parameters) as conn:
-            logger.info("connected to rabbitmq: calling main_loop")
-            chan = conn.channel()
-            self.main_loop(conn, chan)
+        self.connection = pika.BlockingConnection(parameters)
+        logger.info("connected to rabbitmq: calling main_loop")
+        chan = self.connection.channel()
+        # XXX enable transactions here?
+        self.main_loop(self.connection, chan)
 
     def main_loop(self, conn: pika.BlockingConnection, chan):
         raise PipelineException('must override main_loop!')
@@ -89,27 +93,50 @@ class Worker:
             encoded,            # body
             pika.BasicProperties(content_type=content_type))
 
+    # for generators:
+    def send_items(self, chan, items):
+        print("send_items", len(items))  # DEBUG logging?
+        sys.stdout.flush()
+        # XXX split up into multiple msgs as needed!
+        # XXX per-process (OUTPUT_BATCH) for max items/msg?????
+        # XXX take dest exchange??
+        # XXX perform wrapping?
+        self.send_message(chan, items)
+
 
 class ConsumerWorker(Worker):
     """Base class for Workers that consume messages"""
 
+    # XXX maybe allow command line args, environment overrides?
     # override this to allow enable input batching
-    INPUT_BATCH = 1
+    INPUT_BATCH_MSGS = 1
+
+    # if INPUT_BATCH_MSGS > 1, wait no longer than INPUT_BATCH_SECS after 
+    # first message, then process messages on hand:
+    INPUT_BATCH_SECS = 120
 
     def __init__(self, process_name: str, descr: str):
         super().__init__(process_name, descr)
         self.input_msgs = []
+        self.input_timer = None
 
     def main_loop(self, conn: pika.BlockingConnection, chan):
         """
         basic main_loop for a consumer.
         override for a producer!
         """
-        # XXX allow environment/cmd-line override??
-        if self.INPUT_BATCH > 1:
-            chan.basic_qos(self.INPUT_BATCH, global_qos=False)  # RabbitMQ ext.
         chan.tx_select()        # enter transaction mode
-        chan.basic_consume(self.input_queue_name, self.on_message)
+
+        arguments = {}
+        # if batching multiple input messages,
+        # set consumer timeout accordingly
+        if self.INPUT_BATCH_MSGS > 1 and self.INPUT_BATCH_SECS:
+            # add a small grace period, convert to milliseconds
+            ms = (self.INPUT_BATCH_SECS + 10) * 1000
+            arguments['x-consumer-timeout'] = ms
+        chan.basic_consume(self.input_queue_name, self.on_message,
+                           arguments=arguments)
+
         chan.start_consuming()
 
     def on_message(self, chan, method, properties, body):
@@ -117,23 +144,46 @@ class ConsumerWorker(Worker):
         basic_consume callback function
         """
 
+        print("on_message", method.delivery_tag)
+        sys.stdout.flush()
+
         self.input_msgs.append( (method, properties, body) )
-        if len(self.input_msgs) < self.INPUT_BATCH:
+
+        if len(self.input_msgs) < self.INPUT_BATCH_MSGS:
+            # here only when batching multiple msgs
+            if self.input_timer is None and self.INPUT_BATCH_SECS:
+                self.input_timer = \
+                    self.connection.call_later(self.INPUT_BATCH_SECS,
+                                               lambda : self._process_messages(chan))
             return
 
         # here with full batch: start processing
+        if self.input_timer:
+            self.connection.remove_timeout(self.input_timer)
+            self.input_timer = None
+        self._process_messages(chan)
+
+    def _process_messages(self, chan):
+        """
+        Here w/ INPUT_BATCH_MSGS or
+        INPUT_BATCH_SECS elapsed after first message
+        """
         for m, p, b in self.input_msgs:
+            # XXX wrap in try? reject bad msgs??
             decoded = self.decode_message(p, b)
             self.process_message(chan, m, p, decoded)
-            # XXX check processing status??
+            # XXX check processing status?? reject bad msgs?
 
-        self.flush_output(self, chan)
-        chan.tx_commit()
+        self.end_of_batch(chan)
+        self.flush_output(chan)  # generate message(s)
+        chan.tx_commit()         # commit messages
 
         # ack last message only:
-        chan.basic_ack(delivery_tag=method.delivery_tag)
+        multiple = len(self.input_msgs) > 1
+        tag = self.input_msgs[-1][0].delivery_tag # tag from last message
+        print("ack", tag, multiple)
+        chan.basic_ack(delivery_tag=tag, multiple=multiple)
         self.input_msgs = []
-
         sys.stdout.flush()      # for redirection, supervisord
 
     def decode_message(self, properties, body):
@@ -146,9 +196,11 @@ class ConsumerWorker(Worker):
     def process_message(self, chan, method, properties, decoded):
         raise PipelineException("Worker.process_message not overridden")
 
-
-    def flush_output(self):
+    def flush_output(self, chan):
         """hook for ListConsumer"""
+
+    def end_of_batch(self, chan):
+        """hook for batch processors (ie; write to database)"""
 
 class ListConsumerWorker(ConsumerWorker):
     """Pipeline worker that handles list of work items"""
@@ -159,19 +211,20 @@ class ListConsumerWorker(ConsumerWorker):
 
     def process_message(self, chan, method, properties, decoded):
         results = []
+        print("process_message", len(decoded), "items")  # DEBUG logging?
+        sys.stdout.flush()
         for item in decoded:
             # XXX return exchange name too?
             result = self.process_item(item)
             if result:
                 # XXX append to per-exchange list?
-                self.output_items(result)
+                self.output_items.append(result)
 
     def flush_output(self, chan):
-        # XXX split up into multiple msgs as needed!
-        # XXX per-process (OUTPUT_BATCH) for max items/msg?????
         # XXX iterate for dict of lists of items by dest exchange??
-        self.send_message(chan, self.output_items)
-        self.output_items = []
+        if self.output_items:
+            self.send_items(chan, self.output_items)
+            self.output_items = []
 
     def process_item(self, item):
         raise PipelineException(
