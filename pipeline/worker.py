@@ -12,6 +12,10 @@ import time
 # PyPI
 import pika
 
+FORMAT = '%(asctime)s | %(levelname)s | %(name)s | %(message)s'
+LEVEL_DEST = 'log_level'        # args entry name!
+LEVELS = [level.lower() for level in logging._nameToLevel.keys()]
+LOGGER_LEVEL_SEP = ':'
 
 class PipelineException(Exception):
     """base class for pipeline exceptions"""
@@ -55,13 +59,60 @@ class Worker:
                         default=default_url,
                         help="set RabbitMQ URL (default {default_url}")
 
+        # logging, a subset from rss-fetcher fetcher.logargparse:
+        ap.add_argument('--debug', '-d', action='store_const',
+                        const='DEBUG', dest=LEVEL_DEST,
+                        help="set default logging level to 'DEBUG'")
+        ap.add_argument('--quiet', '-q', action='store_const',
+                        const='WARNING', dest=LEVEL_DEST,
+                        help="set default logging level to 'WARNING'")
+
+        # UGH! requires positional args! Implement as an Action class?
+        ap.add_argument('--list-loggers', action='store_true',
+                        dest='list_loggers',
+                        help="list all logger names and exit")
+        ap.add_argument('--log-level', '-l', action='store', choices=LEVELS,
+                        dest=LEVEL_DEST, default=os.getenv('LOG_LEVEL', 'INFO'),
+                        help="set default logging level to LEVEL")
+
+        # set specific logger verbosity:
+        ap.add_argument('--logger-level', '-L', action='append',
+                        dest='logger_level',
+                        help=('set LOGGER (see --list-loggers) '
+                              'verbosity to LEVEL (see --log-level)'),
+                        metavar=f"LOGGER{LOGGER_LEVEL_SEP}LEVEL")
+
     def main(self):
         ap = argparse.ArgumentParser(self.process_name, self.descr)
         self.define_options(ap)
         self.args = ap.parse_args()
 
+        ################ handle logging args FIRST!
+        if self.args.list_loggers:
+            for name in sorted(logging.root.manager.loggerDict):
+                print(name)
+            ap.exit()
+
+        level = getattr(self.args, LEVEL_DEST)
+        if level is None:
+            level = 'INFO'
+        else:
+            level = level.upper()
+
+        logging.basicConfig(format=FORMAT, level=level)
+
+        if self.args.logger_level:
+            for ll in self.args.logger_level:
+                logger_name, level = ll.split(LOGGER_LEVEL_SEP, 1)
+                # XXX check logger_name in logging.root.manager.loggerDict??
+                # XXX check level.upper() in LEVELS?
+                logging.getLogger(logger_name).setLevel(level.upper())
+
+        ################ logging now enabled
+
         if not self.args.amqp_url:
-            raise PipelineException('need RabbitMQ URL')
+            logger.fatal('need RabbitMQ URL')
+            ap.exit(1)
         parameters = pika.connection.URLParameters(self.args.amqp_url)
 
         self.connection = pika.BlockingConnection(parameters)
@@ -91,8 +142,7 @@ class Worker:
 
     # for generators:
     def send_items(self, chan, items):
-        print("send_items", len(items))  # DEBUG logging?
-        sys.stdout.flush()
+        logger.debug(f"send_items {len(items)}")
         # XXX split up into multiple msgs as needed!
         # XXX per-process (OUTPUT_BATCH) for max items/msg?????
         # XXX take dest exchange??
@@ -142,8 +192,7 @@ class ConsumerWorker(Worker):
         basic_consume callback function
         """
 
-        print("on_message", method.delivery_tag)
-        sys.stdout.flush()
+        logger.debug(f"on_message {method.delivery_tag}")
 
         self.input_msgs.append( (method, properties, body) )
 
@@ -180,7 +229,7 @@ class ConsumerWorker(Worker):
         # ack last message only:
         multiple = len(self.input_msgs) > 1
         tag = self.input_msgs[-1][0].delivery_tag # tag from last message
-        print("ack", tag, multiple)
+        logger.debug("ack {tag} {multiple}")
         chan.basic_ack(delivery_tag=tag, multiple=multiple)
         self.input_msgs = []
         sys.stdout.flush()      # for redirection, supervisord
@@ -210,7 +259,7 @@ class ListConsumerWorker(ConsumerWorker):
 
     def process_message(self, chan, method, properties, decoded):
         results = []
-        print("process_message", len(decoded), "items")  # DEBUG logging?
+        logger.info(f"process_message {len(decoded)} items") # make debug?
         t0 = time.time()
         items = 0
         for item in decoded:
@@ -221,7 +270,7 @@ class ListConsumerWorker(ConsumerWorker):
             if result:
                 # XXX append to per-exchange list?
                 self.output_items.append(result)
-        print(f"{os.getpid()} processed {items} items in {(time.time()-t0):.6g} sec")
+        logger.info(f"processed {items} items in {(time.time()-t0):.6f} sec")
         sys.stdout.flush()
 
     def flush_output(self, chan):
