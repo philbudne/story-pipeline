@@ -2,8 +2,6 @@
 Pipeline Worker Definitions
 """
 
-# possible to use tx_select to select transaction mode to get all/or nothing sends to multiple exchanges?
-
 import argparse
 import logging
 import os
@@ -40,7 +38,6 @@ class Worker:
         # ~sigh~ wanted to avoid this, but "call_later" requires it
         self.connection = None
 
-        # XXX maybe have command line options???
         # script/configure.py creates queues/exchanges with process-{in,out}
         # names based on pipeline.json file:
         self.input_queue_name = f"{self.process_name}-in"
@@ -59,7 +56,6 @@ class Worker:
                         help="set RabbitMQ URL (default {default_url}")
 
     def main(self):
-        # call before logargparser.my_parse_args:
         ap = argparse.ArgumentParser(self.process_name, self.descr)
         self.define_options(ap)
         self.args = ap.parse_args()
@@ -69,9 +65,8 @@ class Worker:
         parameters = pika.connection.URLParameters(self.args.amqp_url)
 
         self.connection = pika.BlockingConnection(parameters)
-        logger.info("connected to rabbitmq: calling main_loop")
+        logger.info(f"connected to {self.args.amqp_url}")
         chan = self.connection.channel()
-        # XXX enable transactions here?
         self.main_loop(self.connection, chan)
 
     def main_loop(self, conn: pika.BlockingConnection, chan):
@@ -127,6 +122,8 @@ class ConsumerWorker(Worker):
         override for a producer!
         """
         chan.tx_select()        # enter transaction mode
+        # set "prefetch" limit so messages get distributed among workers:
+        chan.basic_qos(prefetch_count=self.INPUT_BATCH_MSGS*2)
 
         arguments = {}
         # if batching multiple input messages,
@@ -174,6 +171,7 @@ class ConsumerWorker(Worker):
             decoded = self.decode_message(p, b)
             self.process_message(chan, m, p, decoded)
             # XXX check processing status?? reject bad msgs?
+            # XXX increment counters based on status??
 
         self.end_of_batch(chan)
         self.flush_output(chan)  # generate message(s)
@@ -218,11 +216,12 @@ class ListConsumerWorker(ConsumerWorker):
         for item in decoded:
             # XXX return exchange name too?
             result = self.process_item(item)
+            # XXX increment counters based on result??
             items += 1
             if result:
                 # XXX append to per-exchange list?
                 self.output_items.append(result)
-        print(f"processed {items} items in {(time.time()-t0):.6g} sec")
+        print(f"{os.getpid()} processed {items} items in {(time.time()-t0):.6g} sec")
         sys.stdout.flush()
 
     def flush_output(self, chan):
