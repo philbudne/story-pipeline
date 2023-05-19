@@ -41,7 +41,7 @@ class CSVLoad(Worker):
                     print(filename, "not found")
                     continue
 
-            items.append(filename) # full path
+            items.append({'csv': row, 'filename': filename, 'url': row['url']})
             if len(items) >= 5:
                 self.send_items(chan, items)
                 items = []

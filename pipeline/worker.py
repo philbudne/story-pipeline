@@ -9,6 +9,7 @@ import logging
 import os
 import pickle
 import sys
+import time
 
 # PyPI
 import pika
@@ -212,13 +213,17 @@ class ListConsumerWorker(ConsumerWorker):
     def process_message(self, chan, method, properties, decoded):
         results = []
         print("process_message", len(decoded), "items")  # DEBUG logging?
-        sys.stdout.flush()
+        t0 = time.time()
+        items = 0
         for item in decoded:
             # XXX return exchange name too?
             result = self.process_item(item)
+            items += 1
             if result:
                 # XXX append to per-exchange list?
                 self.output_items.append(result)
+        print(f"processed {items} items in {(time.time()-t0):.6g} sec")
+        sys.stdout.flush()
 
     def flush_output(self, chan):
         # XXX iterate for dict of lists of items by dest exchange??
