@@ -270,7 +270,8 @@ class ListConsumerWorker(ConsumerWorker):
             if result:
                 # XXX append to per-exchange list?
                 self.output_items.append(result)
-        logger.info(f"processed {items} items in {(time.time()-t0):.6f} sec")
+        ms = (time.time() - t0) * 1000
+        logger.info(f"processed {items} items in {ms:.3f} ms")
         sys.stdout.flush()
 
     def flush_output(self, chan):
