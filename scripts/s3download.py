@@ -2,6 +2,10 @@
 Download raw HTML archived on in the AWS S3
 mediacloud-downloads-backup bucket.
 
+NOT a "pipeline worker"
+(tho it could be made into one)
+it runs one download at a time!
+
 Database epochs B & D use overlapping download ids ("D" was created as
 a stopgap after 32-bit story ids were exhausted, by restoring an old
 backup, but without advancing the downloads_downloads_id_seq next
@@ -36,6 +40,7 @@ import boto3
 
 BUCKET = 'mediacloud-downloads-backup'
 
+# XXX may need to accept day after end of epoch??
 def epoch_b(date: str) -> bool:
     """expects date in format 'YYYY-MM-DD .....'"""
     return date >= '2021-09-15' and date < '2021-11-21'
@@ -54,6 +59,7 @@ def find_object_version(bucket, date, s3path) -> Optional[str]:
     # should only have two
     saved = []
     for version in versions:
+        # results always start with exact match (then longer strings)?
         if version.key != s3path:
             break
         meta = version.get()    # fetch metadata
@@ -87,6 +93,8 @@ def main() -> None:
 
     t0 = time.time()
     found = downloaded = no_version = 0
+
+    # XXX make this into a utility function??
     for row in reader:
         dl_id = row['downloads_id']
         output = os.path.join(dest_dir, dl_id + '.gz')
@@ -109,7 +117,7 @@ def main() -> None:
         bucket.download_file(s3path, output, extra)
         downloaded += 1
 
-    print(f"found {found} no_version {no_version} downloaded {downloaded} in {time.time() - t0}")
+    print(f"found: {found} no_version: {no_version} downloaded" {downloaded} in {time.time() - t0} sec")
 
 if __name__ == '__main__':
     main()
