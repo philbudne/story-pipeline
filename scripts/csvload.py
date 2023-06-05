@@ -32,6 +32,7 @@ class CSVLoad(Worker):
         dir = self.args.dir
         items = []
         for row in reader:
+            conn.sleep(0)       # poll connection to handle heartbeat!!
             dl_id = row['downloads_id']
             filename = os.path.join(dir, row['downloads_id'])
             if not os.path.exists(filename):
